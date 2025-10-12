@@ -1,19 +1,21 @@
 # rewards.py
 import random
+from plyer import notification
 
-# List of motivational messages
 MOTIVATIONS = [
-    "Great job! Keep the momentum going! 🤗",
+    "Great job! Keep the momentum going! 💪",
     "You’re crushing it! 🌟",
-    "Task completed! Time for a short break 🍵",
+    "Task completed! Take a short break 😌",
     "Another one done! You got this! 🚀",
     "Awesome work! Keep smashing those goals! 🎯"
 ]
 
-def reward_user(points):
-    """
-    Call this function after completing a task.
-    points: total points after completion
-    """
-    message = random.choice(MOTIVATIONS)
-    print(f"\n🎉 {message} — Total points: {points}\n")
+def reward_user(points, message=None):
+    """Show a desktop notification + optional console print (no terminal UI)"""
+    msg = message or random.choice(MOTIVATIONS)
+    full = f"{msg} — Total points: {points}"
+    try:
+        notification.notify(title="Rewards", message=full, timeout=6)
+    except Exception:
+        # fallback: nothing (no terminal output)
+        pass

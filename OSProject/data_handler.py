@@ -1,6 +1,5 @@
-# data_handler.py
-import json
-import os
+# data_handler.py (you probably already have this)
+import json, os
 from datetime import datetime
 
 DATA_FILE = "tasks.json"
@@ -24,5 +23,5 @@ def next_id(tasks):
 def parse_date(s):
     try:
         return datetime.strptime(s, DATE_TIME_FMT)
-    except ValueError:
+    except Exception:
         return None
