@@ -2,29 +2,48 @@
 """
 Cozy Task Scheduler GUI (Pretty Edition)
 ---------------------------------------
-- Cleaned layout, rounded buttons, hover effect, and alternating row colors.
-- Recommended header image: header.jpeg (1920x120px or wider).
+Now with PyInstaller-compatible header image loading and an integrated
+Pomodoro modal that shows a GIF above the timer (GIF bundled by PyInstaller).
 """
 
 import os
+import sys
 import time
 import threading
+import psutil
+from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
+from tkinter import Label, PhotoImage
 from tkcalendar import DateEntry
 
 # External dependencies
 from data_handler import load_data
 from tasks import add_task_data, delete_task_data, mark_complete_data, suggest_edf
-from pomodoro import start_pomodoro_ui
+# Keep import in case you want external pomodoro module later
+try:
+    from pomodoro import start_pomodoro_ui  # not used here; kept for compatibility
+except Exception:
+    start_pomodoro_ui = None
 from reminder_system import check_reminders
 
-# Pillow for header images
+# Pillow for header images (optional)
 try:
     from PIL import Image, ImageTk
     PIL_AVAILABLE = True
 except Exception:
     PIL_AVAILABLE = False
+
+
+# ---------- Resource Path (for PyInstaller) ----------
+def resource_path(relative_path):
+    """Get absolute path to resource, works for dev and for PyInstaller."""
+    try:
+        base_path = sys._MEIPASS  # created by PyInstaller at runtime
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
 
 # ---------- Theme ----------
 COLOR_BG = "#EAD8BB"      # light raffia beige
@@ -77,7 +96,8 @@ def toast_message(root, title, message, duration=3000):
 
         def fade_out(i=12):
             if i < 0:
-                popup.destroy(); return
+                popup.destroy()
+                return
             popup.attributes("-alpha", i / 12)
             popup.after(25, fade_out, i - 1)
 
@@ -117,7 +137,7 @@ class TaskApp:
         # Header image
         self.header_img_label = tk.Label(header, bg=COLOR_HEADER)
         self.header_img_label.place(x=0, y=0, relwidth=1, relheight=1)
-        self._load_header_image("header.png")
+        self._load_header_image(resource_path("header.png"))
 
         # Title text overlay
         tk.Label(header, text="🌿 Task Scheduler — Cozy",
@@ -134,9 +154,12 @@ class TaskApp:
             if self._header_pil:
                 w = max(1, event.width)
                 h = int(w / (self._header_pil.width / self._header_pil.height))
-                resized = self._header_pil.resize((w, h), Image.LANCZOS)
-                self._header_img_ref = ImageTk.PhotoImage(resized)
-                self.header_img_label.config(image=self._header_img_ref)
+                try:
+                    resized = self._header_pil.resize((w, h), Image.LANCZOS)
+                    self._header_img_ref = ImageTk.PhotoImage(resized)
+                    self.header_img_label.config(image=self._header_img_ref)
+                except Exception:
+                    pass
         header.bind("<Configure>", _resize_header)
 
         # --- Main area ---
@@ -172,6 +195,10 @@ class TaskApp:
         self.tree.tag_configure("odd", background=COLOR_TABLE_ODD)
         self.tree.tag_configure("even", background=COLOR_TABLE_EVEN)
 
+        # --- New tags for overdue and completed ---
+        self.tree.tag_configure("done", foreground="#4CAF50")        # green for done
+        self.tree.tag_configure("overdue", foreground="#D32F2F", font=("Georgia", 10, "bold"))  # red & bold
+        
         vsb = ttk.Scrollbar(left, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
         self.tree.pack(side="left", fill="both", expand=True)
@@ -183,8 +210,6 @@ class TaskApp:
         right.pack_propagate(False)
 
         # Rounded button look
-        style = ttk.Style()
-        style.theme_use("clam")
         style.configure(
             "Rounded.TButton",
             background=COLOR_BTN,
@@ -195,13 +220,12 @@ class TaskApp:
             borderwidth=0
         )
         style.map("Rounded.TButton",
-                background=[("active", COLOR_BTN_HOVER)])
+                  background=[("active", COLOR_BTN_HOVER)])
 
         def mkbtn(text, cmd):
             btn = ttk.Button(right, text=text, command=cmd, style="Rounded.TButton")
             btn.pack(fill="x", pady=5, padx=14)
             return btn
-
 
         mkbtn("Add Task", self.open_add_popup)
         mkbtn("Delete Task", self.delete_selected)
@@ -247,25 +271,296 @@ class TaskApp:
         tasks = data.get("tasks", [])
         for idx, t in enumerate(tasks, start=1):
             status = "DONE" if t.get("completed") else "PENDING"
-            tag = "even" if idx % 2 == 0 else "odd"
+            
+            # Parse deadline
+            try:
+                deadline_dt = datetime.strptime(t.get("deadline"), "%Y-%m-%d %H:%M")
+            except Exception:
+                deadline_dt = None
 
-            # Insert serial number (displayed) but store real id as a tag
+            # Determine tag
+            if t.get("completed"):
+                tag = "done"
+            elif deadline_dt and deadline_dt < datetime.now():
+                tag = "overdue"
+            else:
+                tag = "even" if idx % 2 == 0 else "odd"
+
             self.tree.insert(
                 "",
                 "end",
-                values=(
-                    idx,  # serial display only
-                    t.get("name"),
-                    t.get("deadline"),
-                    t.get("duration_hours"),
-                    t.get("priority"),
-                    status,
-                ),
+                values=(idx, t.get("name"), t.get("deadline"),
+                        t.get("duration_hours"), t.get("priority"), status),
                 tags=(tag, str(t.get("id")))
             )
 
+        # Check if any overdue tasks exist
+        if any(
+            (datetime.strptime(t.get("deadline"), "%Y-%m-%d %H:%M") < datetime.now() 
+            and not t.get("completed")) 
+            for t in tasks
+        ):
+            toast_message(self.root, "⚠️ Overdue Tasks", "You have tasks past their deadlines!")
+
+
         pts = data.get("points", 0)
         self.root.title(f"Task Scheduler — Cozy — Points: {pts}")
+
+
+    # ---------- Pomodoro modal (integrated + app blocking) ----------
+    def start_pomodoro_modal(self, task_name, focus_minutes=25, break_minutes=5, blocked_apps=None):
+        """Pomodoro modal with GIFs, timer, and app-blocking."""
+
+        import threading
+        import psutil
+        from winotify import Notification, audio
+
+        # --- Helper: Toast notifications ----------
+        def toast(title: str, msg: str, long: bool = False):
+            n = Notification(
+                app_id="Focus Timer",
+                title=title,
+                msg=msg,
+                icon="chick.ico",
+                duration="long" if long else "short"
+            )
+            n.set_audio(audio.Default, loop=False)
+            n.show()
+
+        # --- Create modal window ---
+        win = tk.Toplevel(self.root)
+        win.title(f"Pomodoro — {task_name}")
+        win.attributes("-fullscreen", True)
+        win.configure(bg=COLOR_BG)
+        win.transient(self.root)
+        win.grab_set()  # modal behavior
+
+        # --- GIFs ----------
+        focus_gif_path = resource_path("pomodoro.gif")
+        break_gif_path = resource_path("pomodoro_break.gif")
+        gifs = {"focus": [], "break": []}
+        for mode, path in [("focus", focus_gif_path), ("break", break_gif_path)]:
+            if os.path.exists(path):
+                frames = []
+                i = 0
+                while True:
+                    try:
+                        frame = tk.PhotoImage(file=path, format=f"gif - {i}")
+                        frames.append(frame)
+                        i += 1
+                    except Exception:
+                        break
+                gifs[mode] = frames
+
+        # GIF label
+        gif_label = tk.Label(win, bg=COLOR_BG)
+        gif_label.pack(pady=(18, 8))
+
+        # Timer label
+        timer_var = tk.StringVar()
+        timer_label = tk.Label(win, textvariable=timer_var,
+                            font=("Segoe UI", 36, "bold"),
+                            bg=COLOR_BG, fg=COLOR_TEXT)
+        timer_label.pack(pady=(6, 12))
+
+        # Controls frame
+        controls_frame = tk.Frame(win, bg=COLOR_BG)
+        controls_frame.pack(pady=(8, 6))
+
+        # --- State dictionary ----------
+        state = {
+            "mode": "focus",
+            "running": False,
+            "paused": False,
+            "after_id": None,
+            "anim_after_id": None,
+            "gif_index": 0,
+            "gifs": gifs,
+            "focus_minutes": focus_minutes,
+            "break_minutes": break_minutes,
+            "remaining": focus_minutes * 60,
+            "blocked_apps": blocked_apps or set(),
+            "blocking": False,
+            "block_thread": None,
+        }
+
+        # --- GIF animation ----------
+        def animate_gif():
+            frames = state["gifs"][state["mode"]]
+            if frames:
+                gif_label.configure(image=frames[state["gif_index"]])
+                state["gif_index"] = (state["gif_index"] + 1) % len(frames)
+                state["anim_after_id"] = win.after(100, animate_gif)
+
+        def start_gif():
+            if state["anim_after_id"] is None:
+                animate_gif()
+
+        def stop_gif():
+            if state["anim_after_id"]:
+                try:
+                    win.after_cancel(state["anim_after_id"])
+                except Exception:
+                    pass
+                state["anim_after_id"] = None
+
+        # --- Timer helper ----------
+        def format_time(s):
+            m = s // 60
+            sec = s % 60
+            return f"{m:02d}:{sec:02d}"
+
+        # --- Kill blocked apps (CLI style) ----------
+        def kill_blocked(blockset: set[str]) -> int:
+            v = 0
+            for p in psutil.process_iter(["name", "exe"]):
+                try:
+                    name = (p.info["name"] or "").lower()
+                    exe  = (p.info["exe"] or "").lower()
+                    match = (
+                        name in blockset
+                        or (exe and any(exe.endswith(b) for b in blockset))
+                    )
+                    if match:
+                        pname = name or exe or "process"
+                        try:
+                            p.terminate()
+                            try:
+                                p.wait(timeout=1.0)
+                            except psutil.TimeoutExpired:
+                                p.kill()
+                            action = "killed"
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            action = "denied"
+                        v += 1
+                        toast("Blocked", f"{pname} ({action})")
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            return v
+
+        # --- Blocking thread ----------
+        def block_apps():
+            state["blocking"] = True
+            while state["blocking"]:
+                if state["blocked_apps"]:
+                    kill_blocked(state["blocked_apps"])
+                time.sleep(0.75)
+
+        def start_blocking():
+            if state["blocked_apps"] and not state["block_thread"]:
+                t = threading.Thread(target=block_apps, daemon=True)
+                t.start()
+                state["block_thread"] = t
+
+        def stop_blocking():
+            state["blocking"] = False
+            state["block_thread"] = None
+
+        # --- Timer tick ----------
+        def timer_tick():
+            if not state["running"]:
+                return
+            if state["remaining"] <= 0:
+                state["running"] = False
+                stop_gif()
+                stop_blocking()
+                if state["mode"] == "focus":
+                    toast("Focus Finished", f"Time for a {break_minutes}-minute break!")
+                    start_break()
+                else:
+                    toast("Break Finished", "Back to focus!")
+                    win.destroy()
+                return
+            state["remaining"] -= 1
+            timer_var.set(format_time(state["remaining"]))
+            state["after_id"] = win.after(1000, timer_tick)
+
+        # --- Start / Pause / Reset ----------
+        def start_timer():
+            if state["running"]:
+                return
+            state["running"] = True
+            state["paused"] = False
+            start_gif()
+            if state["mode"] == "focus":
+                start_blocking()
+            timer_tick()
+
+        def pause_timer():
+            if not state["running"]:
+                return
+            state["running"] = False
+            state["paused"] = True
+            if state["after_id"]:
+                try:
+                    win.after_cancel(state["after_id"])
+                except Exception:
+                    pass
+                state["after_id"] = None
+            stop_gif()
+            stop_blocking()
+
+        def reset_timer():
+            state["running"] = False
+            state["paused"] = False
+            if state["after_id"]:
+                try:
+                    win.after_cancel(state["after_id"])
+                except Exception:
+                    pass
+                state["after_id"] = None
+            state["gif_index"] = 0
+            state["remaining"] = state["focus_minutes"] * 60 if state["mode"] == "focus" else state["break_minutes"] * 60
+            timer_var.set(format_time(state["remaining"]))
+            stop_gif()
+            frames = state["gifs"][state["mode"]]
+            if frames:
+                gif_label.configure(image=frames[0])
+
+        def close_win():
+            state["running"] = False
+            stop_gif()
+            stop_blocking()
+            if state["after_id"]:
+                try:
+                    win.after_cancel(state["after_id"])
+                except Exception:
+                    pass
+            try:
+                win.grab_release()
+            except Exception:
+                pass
+            win.destroy()
+
+        # --- Break logic ----------
+        def start_break():
+            state["mode"] = "break"
+            state["remaining"] = break_minutes * 60
+            state["gif_index"] = 0
+            start_timer()
+
+        # --- Buttons ----------
+        btn_start = tk.Button(controls_frame, text="Start", command=start_timer,
+                            bg=COLOR_BTN, fg="white", font=FONT_NORMAL, relief="flat", padx=8, pady=6)
+        btn_pause = tk.Button(controls_frame, text="Pause", command=pause_timer,
+                            bg=COLOR_BTN, fg="white", font=FONT_NORMAL, relief="flat", padx=8, pady=6)
+        btn_reset = tk.Button(controls_frame, text="Reset", command=reset_timer,
+                            bg=COLOR_BTN, fg="white", font=FONT_NORMAL, relief="flat", padx=8, pady=6)
+        btn_close = tk.Button(win, text="Close", command=close_win,
+                            bg=COLOR_HEADER, fg=COLOR_BG, font=FONT_NORMAL, relief="flat", padx=8, pady=6)
+
+        btn_start.grid(row=0, column=0, padx=6)
+        btn_pause.grid(row=0, column=1, padx=6)
+        btn_reset.grid(row=0, column=2, padx=6)
+        btn_close.pack(pady=(10, 12))
+
+        # initialize timer display
+        timer_var.set(format_time(state["remaining"]))
+        win.protocol("WM_DELETE_WINDOW", close_win)
+
+        return win
+
+
 
     # ---------- Actions ----------
     def open_add_popup(self):
@@ -308,32 +603,34 @@ class TaskApp:
         def submit():
             name = name_entry.get().strip()
             if not name:
-                messagebox.showerror("Error", "Task name required"); return
+                messagebox.showerror("Error", "Task name required")
+                return
             date_str = date_entry.get_date().strftime("%Y-%m-%d")
             try:
                 hour, minute = int(hour_spin.get()), int(min_spin.get())
                 duration = float(dur_entry.get())
                 priority = int(prio_spin.get())
             except Exception:
-                messagebox.showerror("Error", "Invalid input values"); return
+                messagebox.showerror("Error", "Invalid input values")
+                return
             deadline = f"{date_str} {hour:02d}:{minute:02d}"
             add_task_data(load_data(), name, deadline, duration, priority)
             popup.destroy()
             self.refresh()
             toast_message(self.root, "Task added", f"'{name}' — due {deadline}")
 
-        mkbtn = tk.Button(frm, text="Add Task", command=submit,
-                          bg=COLOR_BTN, fg="white", font=FONT_NORMAL,
-                          relief="flat", padx=6, pady=4)
-        mkbtn.grid(row=6, column=1, pady=12)
+        tk.Button(frm, text="Add Task", command=submit,
+                  bg=COLOR_BTN, fg="white", font=FONT_NORMAL,
+                  relief="flat", padx=6, pady=4).grid(row=6, column=1, pady=12)
 
     def delete_selected(self):
         sel = self.tree.selection()
         if not sel:
-            messagebox.showinfo("Select", "Select a task row first."); return
+            messagebox.showinfo("Select", "Select a task row first.")
+            return
         item = sel[0]
         tags = self.tree.item(item)["tags"]
-        task_id = int(tags[1]) if len(tags) > 1 else int(tags[0])  # real ID from tag
+        task_id = int(tags[1]) if len(tags) > 1 else int(tags[0])
         name = self.tree.item(item)["values"][1]
 
         if not messagebox.askyesno("Confirm delete", f"Delete task {task_id}: {name}?"):
@@ -345,7 +642,8 @@ class TaskApp:
     def complete_selected(self):
         sel = self.tree.selection()
         if not sel:
-            messagebox.showinfo("Select", "Select a task row first."); return
+            messagebox.showinfo("Select", "Select a task row first.")
+            return
         item = sel[0]
         tags = self.tree.item(item)["tags"]
         task_id = int(tags[1]) if len(tags) > 1 else int(tags[0])
@@ -357,25 +655,49 @@ class TaskApp:
     def start_pomodoro_selected(self):
         sel = self.tree.selection()
         if not sel:
-            messagebox.showinfo("Select", "Select a task row first."); return
-        vitem = sel[0]
+            messagebox.showinfo("Select", "Select a task row first.")
+            return
+        item = sel[0]
         tags = self.tree.item(item)["tags"]
         task_id = int(tags[1]) if len(tags) > 1 else int(tags[0])
 
         data = load_data()
         task = next((t for t in data.get("tasks", []) if t.get("id") == task_id), None)
         if not task:
-            messagebox.showerror("Error", "Task not found"); return
-        minutes = simpledialog.askinteger("Pomodoro minutes", "Duration (default 25):", initialvalue=25, minvalue=1)
-        if not minutes:
+            messagebox.showerror("Error", "Task not found")
             return
-        start_pomodoro_ui(self.root, task.get("name"), duration_minutes=minutes)
+
+        focus_minutes = simpledialog.askinteger(
+            "Focus Time", "Focus duration in minutes (default 25):",
+            initialvalue=25, minvalue=1
+        )
+        if not focus_minutes:
+            return
+
+        break_minutes = simpledialog.askinteger(
+            "Break Time", "Break duration in minutes (default 5):",
+            initialvalue=5, minvalue=1
+        )
+        if not break_minutes:
+            return
+        # Optional: ask user for apps to block
+        blocked_input = simpledialog.askstring(
+            "Block Apps",
+            "Enter app names to block during focus (comma-separated):",
+            parent=self.root
+        )
+        blocked_apps = set(b.strip().lower() for b in blocked_input.split(",") if b.strip()) if blocked_input else None
+
+        # Start Pomodoro modal
+        self.start_pomodoro_modal(task.get("name"), focus_minutes, break_minutes, blocked_apps)
+
 
     def show_edf(self):
         tasks = suggest_edf(load_data())
         if not tasks:
-            messagebox.showinfo("EDF", "No pending tasks"); return
-        text = "\n".join(f"{i+1}. {t['name']} — {t['deadline']} — {t['duration_hours']}h — prio {t['priority']}" for i,t in enumerate(tasks))
+            messagebox.showinfo("EDF", "No pending tasks")
+            return
+        text = "\n".join(f"{i+1}. {t['name']} — {t['deadline']} — {t['duration_hours']}h — prio {t['priority']}" for i, t in enumerate(tasks))
         messagebox.showinfo("EDF Suggested Order", text)
 
     def show_summary(self):
@@ -392,6 +714,7 @@ def main():
     root = tk.Tk()
     TaskApp(root)
     root.mainloop()
+
 
 if __name__ == "__main__":
     main()
